@@ -1175,8 +1175,17 @@ class A2UIAgent:
                         live_render_call_id = self._first_render_call_id(cru)
                     # Forward each per-chunk update so the hosting loop paints the
                     # render_a2ui argument fragments progressively.
+                    # The invocation site knows the parent; message proximity and
+                    # surface IDs cannot establish this relationship on replay.
+                    forwarded_contents = [copy.copy(content) for content in cru.contents]
+                    for content in forwarded_contents:
+                        if content.type == "function_call" and content.name == RENDER_A2UI_TOOL_NAME:
+                            content.additional_properties = {
+                                **content.additional_properties,
+                                "ag_ui_parent_tool_call_id": call.call_id,
+                            }
                     yield AgentResponseUpdate(
-                        contents=cru.contents,
+                        contents=forwarded_contents,
                         role=getattr(cru, "role", None),
                         message_id=getattr(cru, "message_id", None),
                         response_id=getattr(cru, "response_id", None),

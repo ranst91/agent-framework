@@ -27,6 +27,7 @@ AG-UI protocol integration for building agent UIs with the AG-UI standard.
 ## Protocol Notes
 
 - Outbound custom events are emitted as AG-UI `CUSTOM`.
+- A2UI snapshot render calls retain explicit `parentToolCallId`; tool results retain emission order through cold hydration.
 - Usage metadata from `Content(type="usage")` is surfaced as `CUSTOM` events with `name="usage"`.
 - Text annotations are surfaced as `CUSTOM` events with `name="annotations"` and
   `value={"messageId": ..., "annotations": [...]}`. Annotation-only updates announce a text message if needed

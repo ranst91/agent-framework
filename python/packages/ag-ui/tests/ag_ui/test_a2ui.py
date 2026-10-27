@@ -2503,3 +2503,88 @@ def test_final_narration_turn_forces_tools_off():
     asyncio.run(_drive(A2UIAgent(inner, _RenderSub())))
     assert inner.calls >= 2  # planner round(s) + a final narration turn
     assert (seen_options[-1] or {}).get("tool_choice") == "none"  # final turn: tools off
+
+
+async def test_render_subagent_records_actual_parent_without_mutating_provider_content():
+    provider_content = Content.from_function_call(
+        call_id="inner",
+        name="render_a2ui",
+        arguments=json.dumps({"surfaceId": "s1", "components": [{"id": "root", "component": "Card"}]}),
+    )
+
+    class Render:
+        def get_response(self, *args, **kwargs):
+            async def stream():
+                yield ChatResponseUpdate(role="assistant", contents=[provider_content])
+
+            return stream()
+
+    runner = enable_a2ui(_GenerateOnceInner(), Render())
+    contents = [content async for update in runner.run("card", stream=True) for content in update.contents]
+    inner = next(content for content in contents if content.type == "function_call" and content.call_id == "inner")
+    assert inner.additional_properties["ag_ui_parent_tool_call_id"] == "g1"
+    assert "ag_ui_parent_tool_call_id" not in provider_content.additional_properties
+
+
+async def test_nested_retry_public_snapshot_after_cold_restore(tmp_path):
+    from dataclasses import asdict
+
+    from agent_framework_ag_ui import AgentFrameworkAgent, AGUIThreadSnapshot, InMemoryAGUIThreadSnapshotStore
+    from agent_framework_ag_ui._snapshot_session import ThreadSnapshotSession
+
+    class RetrySub:
+        def __init__(self):
+            self.attempt = 0
+
+        def get_response(self, messages, *, stream=False, options=None):
+            self.attempt += 1
+            call_id = f"render-{self.attempt}"
+            components = [{"id": "bad" if self.attempt == 1 else "root", "component": "Card"}]
+
+            async def stream():
+                yield ChatResponseUpdate(
+                    role="assistant",
+                    contents=[
+                        Content.from_function_call(
+                            call_id=call_id,
+                            name="render_a2ui",
+                            arguments=json.dumps({"surfaceId": "same", "components": components}),
+                        )
+                    ],
+                )
+
+            return stream()
+
+    store = InMemoryAGUIThreadSnapshotStore()
+    runner = A2UIAgent(_GenerateOnceInner(), RetrySub())
+    wrapper = AgentFrameworkAgent(agent=runner, snapshot_store=store)
+    events = [
+        event
+        async for event in wrapper.run(
+            {
+                "thread_id": "nested",
+                "run_id": "live",
+                "__ag_ui_snapshot_scope": "scope",
+                "messages": [{"id": "user", "role": "user", "content": "card"}],
+            }
+        )
+    ]
+    results = [event.tool_call_id for event in events if event.type == "TOOL_CALL_RESULT"]
+    assert results == ["render-1", "render-2", "g1"]
+    stored = await store.get(scope="scope", thread_id="nested")
+    assert stored is not None
+    public = {key: value for key, value in asdict(stored).items() if key != "session_state"}
+    path = tmp_path / "public-snapshot.json"
+    path.write_text(json.dumps(public))
+    fresh_store = InMemoryAGUIThreadSnapshotStore()
+    await fresh_store.save(
+        scope="scope", thread_id="nested", snapshot=AGUIThreadSnapshot(**json.loads(path.read_text()))
+    )
+    cold = await ThreadSnapshotSession.open(store=fresh_store, scope="scope", thread_id="nested")
+    hydrated = [event async for event in cold.hydrate_events(run_id="cold")]
+    messages = next(event for event in hydrated if event.type == "MESSAGES_SNAPSHOT").model_dump(
+        by_alias=True, exclude_none=True
+    )["messages"]
+    assert [message["toolCallId"] for message in messages if message["role"] == "tool"] == results
+    calls = {call["id"]: call for message in messages for call in message.get("toolCalls", [])}
+    assert calls["render-1"]["parentToolCallId"] == calls["render-2"]["parentToolCallId"] == "g1"
