@@ -659,3 +659,12 @@ The package uses a clean, orchestrator-based architecture:
 ## License
 
 MIT
+
+### Nested A2UI snapshot replay
+
+Saved A2UI render calls include the public `parentToolCallId` field identifying
+the `generate_a2ui` invocation that executed the render subagent. Snapshot tool
+results retain emission order, including retries that finish before their parent.
+This metadata survives snapshot serialization and hydration; it does not export
+private session continuation state. Consumers must not infer this relationship
+for older calls from matching surface IDs or content.

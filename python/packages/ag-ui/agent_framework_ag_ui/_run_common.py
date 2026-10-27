@@ -745,11 +745,14 @@ def _emit_tool_call(
             )
         )
 
-        tool_entry = {
+        tool_entry: dict[str, Any] = {
             "id": tool_call_id,
             "type": "function",
             "function": {"name": content.name, "arguments": ""},
         }
+        parent_call_id = content.additional_properties.get("ag_ui_parent_tool_call_id")
+        if isinstance(parent_call_id, str) and parent_call_id:
+            tool_entry["parentToolCallId"] = parent_call_id
         flow.pending_tool_calls.append(tool_entry)
         flow.tool_calls_by_id[tool_call_id] = tool_entry
 
@@ -907,7 +910,7 @@ def _emit_tool_result_common(
     # A result closes the current tool-call segment: a later call opens a new
     # one, so `call A -> result A -> call B` snapshots as two call/result pairs
     # in stream order instead of grouping B with A (moonbox3's replay concern).
-    flow.snapshot_segments.append({"kind": "tool_results"})
+    flow.snapshot_segments.append({"kind": "tool_results", "result_id": message_id})
 
     had_pending_predictive_updates = bool(predictive_handler and predictive_handler.pending_state_updates)
     if predictive_handler:

@@ -2369,10 +2369,11 @@ def _append_segmented_snapshot_messages(flow: FlowState, all_messages: list[dict
 
     Segments tracked during streaming record whether text came before or after
     tool calls (issue #7223); tool results still follow the tool-call message
-    they answer. Anything not covered by segment tracking falls back to the
-    legacy grouping so no content is dropped.
+    they answer only for legacy segments without result positions. Tracked
+    results retain their emission position, including nested calls.
     """
     emitted_call_ids: set[str] = set()
+    positioned_result_ids = {segment["result_id"] for segment in flow.snapshot_segments if segment.get("result_id")}
 
     for segment in flow.snapshot_segments:
         kind = segment["kind"]
@@ -2393,7 +2394,13 @@ def _append_segmented_snapshot_messages(flow: FlowState, all_messages: list[dict
             # leftover path below rather than vanishing silently.
             emitted_ids = {call["id"] for call in calls}
             emitted_call_ids.update(emitted_ids)
-            all_messages.extend(result for result in flow.tool_results if result.get("toolCallId") in emitted_ids)
+            all_messages.extend(
+                result
+                for result in flow.tool_results
+                if result.get("toolCallId") in emitted_ids and result.get("id") not in positioned_result_ids
+            )
+        elif kind == "tool_results" and segment.get("result_id"):
+            all_messages.extend(result for result in flow.tool_results if result.get("id") == segment["result_id"])
         elif kind == "reasoning":
             all_messages.extend(entry for entry in flow.reasoning_messages if entry.get("id") == segment["id"])
 
@@ -2411,7 +2418,11 @@ def _append_segmented_snapshot_messages(flow: FlowState, all_messages: list[dict
         # emitted above and then excluded from the final append below.
         all_messages.extend(result for result in flow.tool_results if result.get("toolCallId") in leftover_ids)
         emitted_call_ids.update(leftover_ids)
-    all_messages.extend(result for result in flow.tool_results if result.get("toolCallId") not in emitted_call_ids)
+    all_messages.extend(
+        result
+        for result in flow.tool_results
+        if result.get("toolCallId") not in emitted_call_ids and result.get("id") not in positioned_result_ids
+    )
 
 
 def _build_messages_snapshot(
@@ -2496,59 +2507,22 @@ def _build_safe_point_messages_snapshot(
     """Build an intermediate snapshot without unfinalized text or reasoning."""
     all_messages = list(snapshot_messages)
     safe_call_ids = _safe_point_tool_call_ids(flow)
-    results_by_call_id: dict[str, list[dict[str, Any]]] = {}
-    for result in flow.tool_results:
-        call_id = result.get("toolCallId")
-        if call_id is not None:
-            results_by_call_id.setdefault(str(call_id), []).append(result)
-
-    emitted_call_ids: set[str] = set()
-    for segment in flow.snapshot_segments:
-        if segment.get("kind") != "tool_calls":
-            continue
-        calls = [
-            flow.tool_calls_by_id[call_id]
-            for call_id in segment.get("call_ids", [])
-            if call_id in safe_call_ids and call_id in flow.tool_calls_by_id
-        ]
-        if not calls:
-            continue
-        all_messages.append(
-            {
-                "id": str(segment.get("id") or generate_event_id()),
-                "role": "assistant",
-                "tool_calls": [call.copy() for call in calls],
-            }
-        )
-        for call in calls:
-            call_id = str(call["id"])
-            emitted_call_ids.add(call_id)
-            all_messages.extend(results_by_call_id.get(call_id, []))
-
-    leftover_calls = [
-        call
-        for call in flow.pending_tool_calls
-        if (call_id := call.get("id")) is not None
-        and str(call_id) in safe_call_ids
-        and str(call_id) not in emitted_call_ids
+    # A completed child needs its declared parent even while the parent is
+    # still running. Only follow producer-recorded ancestry.
+    for call_id in list(safe_call_ids):
+        parent = flow.tool_calls_by_id.get(call_id, {}).get("parentToolCallId")
+        if parent in flow.tool_calls_by_id:
+            safe_call_ids.add(parent)
+    safe_flow = copy.copy(flow)
+    safe_flow.pending_tool_calls = [call for call in flow.pending_tool_calls if call.get("id") in safe_call_ids]
+    safe_flow.tool_calls_by_id = {
+        call_id: call for call_id, call in flow.tool_calls_by_id.items() if call_id in safe_call_ids
+    }
+    safe_flow.snapshot_segments = [
+        dict(segment) for segment in flow.snapshot_segments if segment.get("kind") in {"tool_calls", "tool_results"}
     ]
-    if leftover_calls:
-        all_messages.append(
-            {
-                "id": generate_event_id(),
-                "role": "assistant",
-                "tool_calls": [call.copy() for call in leftover_calls],
-            }
-        )
-        for call in leftover_calls:
-            call_id = str(call["id"])
-            emitted_call_ids.add(call_id)
-            all_messages.extend(results_by_call_id.get(call_id, []))
-
-    for call_id, results in results_by_call_id.items():
-        if call_id not in emitted_call_ids:
-            all_messages.extend(results)
-
+    safe_flow.reasoning_messages = []
+    _append_segmented_snapshot_messages(safe_flow, all_messages)
     bounded_messages = _bound_host_payload_history(_persistable_host_payload_history(all_messages))
     return MessagesSnapshotEvent(messages=_project_host_payload_history(bounded_messages))  # type: ignore[arg-type]
 
