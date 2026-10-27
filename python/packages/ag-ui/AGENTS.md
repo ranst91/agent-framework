@@ -93,6 +93,10 @@ AG-UI protocol integration for building agent UIs with the AG-UI standard.
   ids alone; an older request generation for the same occurrence is still invalid.
 - Approval responses for tools injected during `before_run` are deferred to the in-run approval middleware rather
   than executed or rejected by the transport before those tools exist.
+- `AgentFrameworkAgent(durable_approvals=True)` retains private lifecycle authority in the scoped Thread Snapshot.
+  Restore only that private record, never client Shared State, replay messages, or interrupt projections. Commit claims
+  before side effects and propagate claim-write failures; cold unfinished claims fail closed as indeterminate.
+  This requires application-owned atomic durable storage and single-writer serialization, not cross-replica coordination.
 - `_approval_lifecycle.py` is the sole owner of approval occurrence registration, trusted aliases, authority
   validation, claims, terminal outcomes, and retry deduplication. Runner code normalizes AG-UI protocol values and
   projects lifecycle outcomes but must not maintain a parallel pending-approval registry.

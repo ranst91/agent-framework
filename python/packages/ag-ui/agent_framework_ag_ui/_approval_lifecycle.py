@@ -8,11 +8,11 @@ import logging
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from functools import wraps
 from threading import RLock
-from time import monotonic
+from time import monotonic, time
 from typing import Any, TypeVar
 from uuid import uuid4
 
@@ -440,6 +440,111 @@ class ApprovalLifecycle:
         with self._index_lock:
             self._purge_expired_terminal()
             return tuple(occurrence for occurrence in self._occurrences.values() if thread_id in occurrence.thread_ids)
+
+    def export_thread(self, *, thread_id: str) -> dict[str, Any]:
+        """Serialize private authority, never the client-visible interrupt projection."""
+        with self._index_lock:
+            now = self._clock()
+            records: list[dict[str, Any]] = []
+            for occurrence in self.occurrences_for_thread(thread_id=thread_id):
+                record = {
+                    key: getattr(occurrence, key)
+                    for key in (
+                        "thread_ids",
+                        "name",
+                        "arguments",
+                        "function_call_id",
+                        "active_interrupt_id",
+                        "scope",
+                        "aliases",
+                        "response_id",
+                        "already_approved_requests",
+                        "server_label",
+                        "idempotency_key",
+                        "requires_client_resume",
+                    )
+                }
+                record.update(
+                    identity=asdict(occurrence.identity),
+                    owner=occurrence.owner.value,
+                    status=occurrence.status.value,
+                    pending_age=max(0, now - occurrence.pending_since),
+                    terminal_age=None if occurrence.terminal_at is None else max(0, now - occurrence.terminal_at),
+                    decision=asdict(occurrence.decision) if occurrence.decision else None,
+                    results=[result.content.to_dict() for result in occurrence.replayable_results],
+                    result_group=(
+                        [content.to_dict() for content in occurrence.outcome.result_group]
+                        if occurrence.outcome is not None
+                        else None
+                    ),
+                )
+                records.append(record)
+            return {"version": 1, "saved_at": time(), "thread_id": thread_id, "occurrences": records}
+
+    def restore_thread(self, *, thread_id: str, payload: dict[str, Any]) -> None:
+        """Restore trusted storage once; uncertain claims never regain execution authority.
+
+        This is restart recovery for a single writer, not coordination between replicas.
+        Live in-process lifecycle state always takes precedence over an older snapshot.
+        """
+        with self._index_lock:
+            if self.occurrences_for_thread(thread_id=thread_id):
+                return
+            if payload["version"] != 1 or payload["thread_id"] != thread_id:
+                raise ValueError("Stored approval authority has an unsupported version or scope.")
+            elapsed = max(0, time() - payload["saved_at"])
+            now = self._clock()
+            restored: list[ApprovalOccurrence] = []
+            for saved in payload["occurrences"]:
+                record = dict(saved)
+                identity = ApprovalOccurrenceIdentity(**record.pop("identity"))
+                if identity.thread_id != thread_id or tuple(record["thread_ids"]) != (thread_id,):
+                    raise ValueError("Stored approval occurrence belongs to another scope.")
+                owner = ApprovalExecutionOwner(record.pop("owner"))
+                status = ApprovalStatus(record.pop("status"))
+                pending_since = now - record.pop("pending_age") - elapsed
+                terminal_age = record.pop("terminal_age")
+                terminal_at = None if terminal_age is None else now - terminal_age - elapsed
+                decision = record.pop("decision")
+                results = [ReplayableToolResult(Content.from_dict(content)) for content in record.pop("results")]
+                result_group = record.pop("result_group")
+                if status in {ApprovalStatus.CLAIMED, ApprovalStatus.EXECUTING}:
+                    status = ApprovalStatus.INDETERMINATE
+                    terminal_at = now
+                occurrence = ApprovalOccurrence(
+                    identity=identity,
+                    owner=owner,
+                    status=status,
+                    pending_since=pending_since,
+                    terminal_at=terminal_at,
+                    decision=ResumeDecision(**decision) if decision else None,
+                    replayable_results=results,
+                    **{
+                        **record,
+                        "thread_ids": tuple(record["thread_ids"]),
+                        "aliases": tuple(record["aliases"]),
+                        "already_approved_requests": tuple(record["already_approved_requests"]),
+                    },
+                )
+                if result_group is not None:
+                    occurrence.outcome = ApprovalOutcome(
+                        identity=identity,
+                        replayable_results=tuple(results),
+                        result_group=tuple(Content.from_dict(content) for content in result_group),
+                        snapshot_reconciliation=self._snapshot_reconciliation(occurrence),
+                    )
+                restored.append(occurrence)
+            for scope in {occurrence.scope for occurrence in restored}:
+                count = sum(occurrence.scope == scope for occurrence in (*self._occurrences.values(), *restored))
+                if count > self._max_entries:
+                    raise ApprovalCapacityError("Stored approval authority exceeds capacity.")
+            for occurrence in restored:
+                self._occurrences[occurrence.identity] = occurrence
+                self._locks_by_identity[occurrence.identity] = RLock()
+                index = self._terminal_by_interrupt if occurrence.status.is_terminal else self._pending_by_interrupt
+                for alias in occurrence.aliases:
+                    index[(thread_id, alias)] = occurrence.identity
+            self._purge_expired_terminal()
 
     def pending_interrupt_ids(self, *, thread_id: str) -> set[str]:
         """Return canonical interrupt identities with pending authority for one thread."""

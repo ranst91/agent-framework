@@ -1331,3 +1331,52 @@ def test_expired_authority_cannot_be_claimed() -> None:
         )
 
     assert lifecycle.get(occurrence.identity).status is ApprovalStatus.EXPIRED
+
+
+def test_private_snapshot_preserves_expiration_across_downtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent_framework_ag_ui._approval_lifecycle as module
+
+    wall_time = [1000.0]
+    monkeypatch.setattr(module, "time", lambda: wall_time[0])
+    lifecycle = ApprovalLifecycle(pending_retention_seconds=10, clock=lambda: 100.0)
+    lifecycle.register(
+        owner=ApprovalExecutionOwner.LOCAL,
+        thread_id="thread",
+        interrupt_id="approval",
+        call_id="provider",
+        name="tool",
+        arguments="{}",
+    )
+    saved = lifecycle.export_thread(thread_id="thread")
+    wall_time[0] += 11
+    restarted = ApprovalLifecycle(pending_retention_seconds=10, clock=lambda: 900.0)
+    restarted.restore_thread(thread_id="thread", payload=saved)
+    assert restarted.pending_interrupt_ids(thread_id="thread") == set()
+    assert restarted.occurrence_for_alias(thread_id="thread", interrupt_id="approval").status is ApprovalStatus.EXPIRED
+
+
+def test_private_snapshot_restore_respects_scope_capacity() -> None:
+    source = ApprovalLifecycle()
+    source.register(
+        owner=ApprovalExecutionOwner.LOCAL,
+        thread_id="second",
+        interrupt_id="two",
+        call_id="provider-two",
+        name="tool",
+        arguments="{}",
+        scope="tenant",
+    )
+    target = ApprovalLifecycle(max_entries=1)
+    target.register(
+        owner=ApprovalExecutionOwner.LOCAL,
+        thread_id="first",
+        interrupt_id="one",
+        call_id="provider-one",
+        name="tool",
+        arguments="{}",
+        scope="tenant",
+    )
+    with pytest.raises(ApprovalCapacityError):
+        target.restore_thread(thread_id="second", payload=source.export_thread(thread_id="second"))
+    assert target.pending_interrupt_ids(thread_id="first") == {"one"}
+    assert target.pending_interrupt_ids(thread_id="second") == set()

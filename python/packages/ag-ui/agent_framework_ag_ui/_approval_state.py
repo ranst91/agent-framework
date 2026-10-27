@@ -17,6 +17,7 @@ DEFAULT_MAX_APPROVAL_STATES = 10_000
 DEFAULT_PENDING_RETENTION_SECONDS = 86_400
 DEFAULT_INDETERMINATE_RETENTION_SECONDS = 604_800
 DEFAULT_TERMINAL_RETENTION_SECONDS = 900
+_APPROVAL_SNAPSHOT_STATE_KEY = "__ag_ui_approval_authority"
 _APPROVAL_SCOPE_INPUT_KEY = "__ag_ui_approval_scope"
 
 
@@ -131,3 +132,18 @@ class InMemoryAGUIApprovalStateStore:
         """Return whether middleware approval state exists for one scoped thread."""
         with self._lock:
             return thread_id in self._tool_approval_states
+
+    def export_thread(self, thread_id: str) -> dict[str, Any]:
+        """Export server-owned lifecycle and middleware state for trusted snapshot storage."""
+        return {
+            "lifecycle": self.lifecycle.export_thread(thread_id=thread_id),
+            "middleware": self.get_tool_approval_state(thread_id),
+        }
+
+    def restore_thread(self, thread_id: str, payload: dict[str, Any]) -> None:
+        """Restore private authority without replacing live in-process state."""
+        if self.lifecycle.occurrences_for_thread(thread_id=thread_id):
+            return
+        self.lifecycle.restore_thread(thread_id=thread_id, payload=payload["lifecycle"])
+        if payload.get("middleware") is not None:
+            self.set_tool_approval_state(thread_id, payload["middleware"])

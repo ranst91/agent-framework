@@ -30,6 +30,7 @@ class AgentConfig:
         service_session_id_from_thread_id: bool = False,
         emit_messages_snapshot: bool = True,
         legacy_session_id_from_thread_id: bool = False,
+        durable_approvals: bool = False,
     ):
         """Initialize agent configuration.
 
@@ -51,6 +52,9 @@ class AgentConfig:
             emit_messages_snapshot: Whether to emit a terminal MessagesSnapshotEvent at the end of runs.
                 Defaults to True for backward compatibility. Set to False when using HistoryProvider
                 to prevent redundant full-transcript rewrites on the client.
+            durable_approvals: Persist private approval authority in a trusted scoped snapshot store.
+                Requires durable atomic writes and a single writer per thread. Incomplete claims after
+                restart fail closed; this does not coordinate concurrent replicas.
             legacy_session_id_from_thread_id: Deprecated compatibility option that uses the client-owned
                 AG-UI Thread id directly as the internal Agent Session id.
         """
@@ -60,6 +64,7 @@ class AgentConfig:
         self.service_session_id_from_thread_id = service_session_id_from_thread_id
         self.require_confirmation = require_confirmation
         self.snapshot_store = snapshot_store
+        self.durable_approvals = durable_approvals
         self.a2ui_config = a2ui_config
         self.emit_messages_snapshot = emit_messages_snapshot
         self.legacy_session_id_from_thread_id = legacy_session_id_from_thread_id
@@ -113,6 +118,7 @@ class AgentFrameworkAgent:
         service_session_id_from_thread_id: bool = False,
         emit_messages_snapshot: bool = True,
         legacy_session_id_from_thread_id: bool = False,
+        durable_approvals: bool = False,
     ):
         """Initialize the AG-UI compatible agent wrapper.
 
@@ -134,6 +140,9 @@ class AgentFrameworkAgent:
             a2ui_config: Optional backend A2UI config consumed by auto-injection.
             emit_messages_snapshot: Whether to emit a terminal MessagesSnapshotEvent at the end of runs.
                 Defaults to True. Set to False when using HistoryProvider.
+            durable_approvals: Persist private approval authority in a trusted scoped snapshot store.
+                Requires durable atomic writes and a single writer per thread. Incomplete claims after
+                restart fail closed; this does not coordinate concurrent replicas.
             legacy_session_id_from_thread_id: Deprecated compatibility option that uses the client-owned
                 AG-UI Thread id directly as the internal Agent Session id. This disables Snapshot Scope
                 isolation for context-provider state.
@@ -161,6 +170,7 @@ class AgentFrameworkAgent:
             a2ui_config=a2ui_config,
             emit_messages_snapshot=emit_messages_snapshot,
             legacy_session_id_from_thread_id=legacy_session_id_from_thread_id,
+            durable_approvals=durable_approvals,
         )
 
         # Server-side Approval State. Populated when approval requests are emitted

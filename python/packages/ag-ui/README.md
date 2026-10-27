@@ -433,6 +433,41 @@ For applications that need server-authoritative thread history, configure scoped
 mode only accepts user turns and results for backend-issued tool calls when extending stored history. It complements
 endpoint authentication and authorization; it does not replace them.
 
+## Native approval recovery after restart
+
+Approval authority is process-local by default. A replayable interrupt is not sufficient to authorize a tool after
+restart. Opt in on the agent wrapper when the application provides a trusted, scoped durable snapshot store:
+
+```python
+from agent_framework.ag_ui import AgentFrameworkAgent, add_agent_framework_fastapi_endpoint
+
+runner = AgentFrameworkAgent(agent, durable_approvals=True)
+add_agent_framework_fastapi_endpoint(
+    app,
+    runner,
+    snapshot_store=durable_store,
+    authorization_scope_resolver=resolve_authenticated_scope,
+)
+```
+
+The store must retain the complete snapshot, including private `session_state`, and atomically commit writes before
+returning. Its scope must identify the same authorized owner after restart. Serialize all mutations for a thread
+across its entire run; this option supports a single writer and does not implement locks or compare-and-swap across
+replicas. `InMemoryAGUIThreadSnapshotStore` does not provide process-restart durability.
+
+New snapshots retain private server-issued approval occurrences, their original function and provider call identities,
+arguments, middleware continuation, and terminal results. This authority is never reconstructed from client messages,
+Shared State, or the visible interrupt. Old snapshots without the private authority record remain non-resumable.
+Native SDK-only histories use `AgentSession.to_dict()` / `AgentSession.from_dict()` separately; importing their visible
+approval controls does not create AG-UI approval authority.
+
+Before an approved side effect starts, the runner commits its claim. A failed claim write prevents execution. If a
+process stops after the claim or the terminal result cannot be saved, cold recovery treats that claim as indeterminate
+and refuses to execute it again. Applications must reconcile uncertain side effects outside this retry path; this is
+not a guarantee of completing a tool exactly once across arbitrary crashes. Completed persisted approvals retain their
+canonical result, and retries do not rerun the tool during the configured lifecycle retention window. Retention ages
+include downtime. Default pending retention is 24 hours and terminal replay retention is 15 minutes.
+
 ## AG-UI Thread Snapshots
 
 AG-UI Thread Snapshot persistence is opt-in and disabled by default. Existing endpoints keep their current behavior

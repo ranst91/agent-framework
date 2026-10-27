@@ -194,6 +194,15 @@ class ThreadSnapshotSession:
                 self._thread_id,
             )
 
+    async def save_approval_claim(self, *, session_state: dict[str, Any]) -> None:
+        """Persist authority before execution; unlike replay saves, failures are fatal."""
+        if self._store is None or self._scope is None:
+            return
+        snapshot = copy.deepcopy(self._stored) if self._stored is not None else AGUIThreadSnapshot(messages=[])
+        snapshot.session_state = session_state
+        await self._store.save(scope=self._scope, thread_id=self._thread_id, snapshot=snapshot)
+        self._stored = snapshot
+
     async def clear_interrupts(self, *, interrupt_ids: set[str] | None = None) -> None:
         """Remove completed interrupts from the latest stored snapshot.
 

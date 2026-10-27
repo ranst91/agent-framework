@@ -89,7 +89,12 @@ from ._approval_execution import (
     InRunApprovalExecution,
     InRunPendingToolTransitionOwner,
 )
-from ._approval_state import _APPROVAL_SCOPE_INPUT_KEY, InMemoryAGUIApprovalStateStore, approval_state_thread_id
+from ._approval_state import (
+    _APPROVAL_SCOPE_INPUT_KEY,
+    _APPROVAL_SNAPSHOT_STATE_KEY,
+    InMemoryAGUIApprovalStateStore,
+    approval_state_thread_id,
+)
 from ._message_adapters import _APPROVAL_DECISION_IS_BOOLEAN_KEY, normalize_agui_input_messages
 from ._predictive_state import PredictiveStateHandler
 from ._tooling import collect_server_tools, merge_tools
@@ -2575,6 +2580,7 @@ def _restore_session_continuation_state(
     if snapshot is None or snapshot.session_state is None:
         return
     serialized_state = copy.deepcopy(snapshot.session_state)
+    serialized_state.pop(_APPROVAL_SNAPSHOT_STATE_KEY, None)
     service_session_id = serialized_state.pop(_PROVIDER_SERVICE_SESSION_ID_STATE_KEY, None)
     for key in excluded_state_keys:
         serialized_state.pop(key, None)
@@ -2641,6 +2647,7 @@ def _request_state_protected_keys(agent: SupportsAgentRun) -> set[str]:
     agent_middleware = categorize_middleware(getattr(agent, "middleware", None))["agent"]
     return {
         _TOOL_APPROVAL_STATE_KEY,
+        _APPROVAL_SNAPSHOT_STATE_KEY,
         InMemoryHistoryProvider.DEFAULT_SOURCE_ID,
         MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY,
         *(provider.source_id for provider in context_providers),
@@ -2730,6 +2737,7 @@ def _serialize_session_continuation_state(
     excluded_keys = {
         *shared_state_keys,
         _TOOL_APPROVAL_STATE_KEY,
+        _APPROVAL_SNAPSHOT_STATE_KEY,
         _PROVIDER_SERVICE_SESSION_ID_STATE_KEY,
         *(provider.source_id for provider in context_providers if isinstance(provider, HistoryProvider)),
     }
@@ -3004,6 +3012,12 @@ async def _run_agent_stream(
     )
 
     stored_snapshot = snapshot_session.stored
+    if config.durable_approvals and not snapshot_session.enabled:
+        raise ValueError("durable_approvals requires a scoped snapshot store.")
+    if config.durable_approvals and stored_snapshot is not None and stored_snapshot.session_state is not None:
+        authority = stored_snapshot.session_state.get(_APPROVAL_SNAPSHOT_STATE_KEY)
+        if authority is not None:
+            approval_state_store.restore_thread(approval_thread_id, authority)
     stored_pending_approval_interrupt_ids: set[str] = set()
     seeded_resume_from_snapshot = False
     if stored_snapshot is not None:
@@ -3342,6 +3356,18 @@ async def _run_agent_stream(
     _restore_tool_approval_state(session, approval_state_store, approval_thread_id)
     approval_middleware_pipeline = _approval_observer_middleware_pipeline(agent, session)
 
+    def private_snapshot_state() -> dict[str, Any] | None:
+        continuation = _safe_serialize_session_continuation_state(
+            session,
+            agent,
+            shared_state_keys=set(flow.current_state).difference(protected_session_state_keys),
+            include_service_session_id=config.use_service_session,
+        )
+        if config.durable_approvals:
+            continuation = continuation or {}
+            continuation[_APPROVAL_SNAPSHOT_STATE_KEY] = approval_state_store.export_thread(approval_thread_id)
+        return continuation
+
     async def save_thread_snapshot(
         *,
         persisted_messages: list[dict[str, Any]],
@@ -3353,12 +3379,7 @@ async def _run_agent_stream(
             messages=_bound_host_payload_history(_persistable_host_payload_history(persisted_messages)),
             state=state,
             interrupt=interrupt,
-            session_state=_safe_serialize_session_continuation_state(
-                session,
-                agent,
-                shared_state_keys=set(flow.current_state).difference(protected_session_state_keys),
-                include_service_session_id=config.use_service_session,
-            ),
+            session_state=private_snapshot_state(),
         )
 
     authenticated_cancellations = [
@@ -3393,12 +3414,7 @@ async def _run_agent_stream(
                 messages=stored_after_cancellation.messages,
                 state=stored_after_cancellation.state,
                 interrupt=stored_after_cancellation.interrupt,
-                session_state=_safe_serialize_session_continuation_state(
-                    session,
-                    agent,
-                    shared_state_keys=set(flow.current_state).difference(protected_session_state_keys),
-                    include_service_session_id=config.use_service_session,
-                ),
+                session_state=private_snapshot_state(),
             )
         yield _build_run_finished_event(run_id=run_id, thread_id=thread_id)
         return
@@ -3533,6 +3549,11 @@ async def _run_agent_stream(
             code="APPROVAL_INVOCATION_DISABLED",
         )
         return
+    if authorized_executions and config.durable_approvals:
+        # Commit the claim before any side effect. A crash or failed terminal save
+        # leaves an indeterminate claim on cold restore, never a fresh grant.
+        _save_tool_approval_state(session, approval_state_store, approval_thread_id)
+        await snapshot_session.save_approval_claim(session_state=private_snapshot_state() or {})
     validated_approved_responses: list[Content] = []
     replacement_approval_requests: list[Content] = []
     newly_resolved_approval_results = await _resolve_approval_responses(
